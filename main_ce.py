@@ -14,7 +14,12 @@ from torchvision import transforms, datasets
 from util import AverageMeter
 from util import adjust_learning_rate, warmup_learning_rate, accuracy
 from util import set_optimizer, save_model
-from networks.resnet_big import SupCEResNet
+from networks.audio_net import SupCENet
+from audio_utils.data_esc50_generator import (Esc50Dataset, Esc50TrainSampler, Esc50BalancedTrainSampler,
+    Esc50AlternateTrainSampler, Esc50EvaluateSampler, esc50_collate_fn)
+from audio_utils.data_fsd50k_generator import (Fsd50kDataset, Fsd50kTrainSampler, Fsd50kBalancedTrainSampler,
+    Fsd50kAlternateTrainSampler, Fsd50kEvaluateSampler, fsd50k_collate_fn)
+from audio_utils.pytorch_utils import move_data_to_device
 
 try:
     import apex
@@ -30,12 +35,25 @@ def parse_option():
                         help='print frequency')
     parser.add_argument('--save_freq', type=int, default=50,
                         help='save frequency')
-    parser.add_argument('--batch_size', type=int, default=256,
+    parser.add_argument('--batch_size', type=int, default=64,
                         help='batch_size')
-    parser.add_argument('--num_workers', type=int, default=16,
+    parser.add_argument('--num_workers', type=int, default=12,
                         help='num of workers to use')
-    parser.add_argument('--epochs', type=int, default=500,
+    parser.add_argument('--epochs', type=int, default=100,
                         help='number of training epochs')
+
+    # audio processing parameters
+    parser.add_argument('--sample_rate', type=int, default=32000)
+    parser.add_argument('--window_size', type=int, default=1024)
+    parser.add_argument('--hop_size', type=int, default=320)
+    parser.add_argument('--mel_bins', type=int, default=64)
+    parser.add_argument('--fmin', type=int, default=50)
+    parser.add_argument('--fmax', type=int, default=14000)
+
+    # data organized method and augmentation method
+    parser.add_argument('--data_type', type=str, default='full_train', choices=['balanced_train', 'full_train'])
+    parser.add_argument('--augmentation', type=str, default='none', choices=['none', 'mixup'])
+    parser.add_argument('--balanced', type=str, default='balanced', choices=['none', 'balanced', 'alternate'])
 
     # optimization
     parser.add_argument('--learning_rate', type=float, default=0.2,
@@ -50,9 +68,9 @@ def parse_option():
                         help='momentum')
 
     # model dataset
-    parser.add_argument('--model', type=str, default='resnet50')
-    parser.add_argument('--dataset', type=str, default='cifar10',
-                        choices=['cifar10', 'cifar100'], help='dataset')
+    parser.add_argument('--model', type=str, default='resnet18')
+    parser.add_argument('--dataset', type=str, default='esc50',
+                        choices=['esc50', 'fsd50k'], help='dataset')
 
     # other setting
     parser.add_argument('--cosine', action='store_true',
@@ -67,7 +85,9 @@ def parse_option():
     opt = parser.parse_args()
 
     # set the path according to the environment
-    opt.data_folder = './datasets/'
+    # set dataset of audio file in hdf5 format
+    opt.data_folder = '/media/storage/home/22828187/audioset_tagging_cnn/hdf5s/'
+
     opt.model_path = './save/SupCon/{}_models'.format(opt.dataset)
     opt.tb_path = './save/SupCon/{}_tensorboard'.format(opt.dataset)
 
@@ -105,70 +125,115 @@ def parse_option():
     if not os.path.isdir(opt.save_folder):
         os.makedirs(opt.save_folder)
 
-    if opt.dataset == 'cifar10':
-        opt.n_cls = 10
-    elif opt.dataset == 'cifar100':
-        opt.n_cls = 100
+    if opt.dataset == 'esc50':
+        opt.n_cls = 50
+    elif opt.dataset == 'fsd50k':
+        opt.n_cls = 200
+    elif opt.dataset == 'esc50_major':
+        opt.ncls = 5
     else:
         raise ValueError('dataset not supported: {}'.format(opt.dataset))
 
     return opt
 
 
-def set_loader(opt):
-    # construct data loader
-    if opt.dataset == 'cifar10':
-        mean = (0.4914, 0.4822, 0.4465)
-        std = (0.2023, 0.1994, 0.2010)
-    elif opt.dataset == 'cifar100':
-        mean = (0.5071, 0.4867, 0.4408)
-        std = (0.2675, 0.2565, 0.2761)
-    else:
-        raise ValueError('dataset not supported: {}'.format(opt.dataset))
-    normalize = transforms.Normalize(mean=mean, std=std)
+def get_esc50_data_loader(opt):
 
-    train_transform = transforms.Compose([
-        transforms.RandomResizedCrop(size=32, scale=(0.2, 1.)),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        normalize,
-    ])
+    balanced = opt.balanced
+    batch_size = opt.batch_size
+    augmentation = opt.augmentation
+    # Paths
+    black_list_csv = None
 
-    val_transform = transforms.Compose([
-        transforms.ToTensor(),
-        normalize,
-    ])
+    num_workers = opt.num_workers
 
-    if opt.dataset == 'cifar10':
-        train_dataset = datasets.CIFAR10(root=opt.data_folder,
-                                         transform=train_transform,
-                                         download=True)
-        val_dataset = datasets.CIFAR10(root=opt.data_folder,
-                                       train=False,
-                                       transform=val_transform)
-    elif opt.dataset == 'cifar100':
-        train_dataset = datasets.CIFAR100(root=opt.data_folder,
-                                          transform=train_transform,
-                                          download=True)
-        val_dataset = datasets.CIFAR100(root=opt.data_folder,
-                                        train=False,
-                                        transform=val_transform)
-    else:
-        raise ValueError(opt.dataset)
+    dataset = Esc50Dataset(sample_rate=opt.sample_rate)
+    train_indexes_hdf5_path = os.path.join(opt.data_folder, 'indexes', 'esc_dev.h5')
+    eval_bal_indexes_hdf5_path = os.path.join(opt.data_folder, 'indexes', 'esc_eval.h5')
+    # Train sampler
+    if balanced == 'none':
+        Sampler = Esc50TrainSampler
+    elif balanced == 'balanced':
+        Sampler = Esc50BalancedTrainSampler
+    elif balanced == 'alternate':
+        Sampler = Esc50AlternateTrainSampler
 
-    train_sampler = None
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=opt.batch_size, shuffle=(train_sampler is None),
-        num_workers=opt.num_workers, pin_memory=True, sampler=train_sampler)
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=256, shuffle=False,
-        num_workers=8, pin_memory=True)
+    train_sampler = Sampler(
+        indexes_hdf5_path=train_indexes_hdf5_path,
+        batch_size=batch_size * 2 if 'mixup' in augmentation else batch_size,
+        black_list_csv=black_list_csv)
+    validate_sampler = Esc50EvaluateSampler(
+        indexes_hdf5_path=eval_bal_indexes_hdf5_path,
+        batch_size=batch_size)
+    # Data loader
+    train_loader = torch.utils.data.DataLoader(dataset=dataset,
+                                               batch_sampler=train_sampler, collate_fn=esc50_collate_fn,
+                                               num_workers=num_workers, pin_memory=True)
 
+    val_loader = torch.utils.data.DataLoader(dataset=dataset,
+                                                  batch_sampler=validate_sampler, collate_fn=esc50_collate_fn,
+                                                  num_workers=num_workers, pin_memory=True)
     return train_loader, val_loader
 
 
+def get_fsd50k_data_loader(opt):
+    balanced = opt.balanced
+    batch_size = opt.batch_size
+    augmentation = opt.augmentation
+    # Paths
+    black_list_csv = None
+
+    num_workers = opt.num_workers
+
+    dataset = Fsd50kDataset(sample_rate=opt.sample_rate)
+    train_indexes_hdf5_path = os.path.join(opt.data_folder, 'indexes', 'fsd50k_dev.h5')
+    eval_bal_indexes_hdf5_path = os.path.join(opt.data_folder, 'indexes', 'fsd50k_eval.h5')
+    # Train sampler
+    if balanced == 'none':
+        Sampler = Fsd50kTrainSampler
+    elif balanced == 'balanced':
+        Sampler = Fsd50kBalancedTrainSampler
+    elif balanced == 'alternate':
+        Sampler = Fsd50kAlternateTrainSampler
+
+    train_sampler = Sampler(
+        indexes_hdf5_path=train_indexes_hdf5_path,
+        batch_size=batch_size * 2 if 'mixup' in augmentation else batch_size,
+        black_list_csv=black_list_csv)
+    validate_sampler = Fsd50kEvaluateSampler(
+        indexes_hdf5_path=eval_bal_indexes_hdf5_path,
+        batch_size=batch_size)
+    # Data loader
+    train_loader = torch.utils.data.DataLoader(dataset=dataset,
+                                               batch_sampler=train_sampler, collate_fn=fsd50k_collate_fn,
+                                               num_workers=num_workers, pin_memory=True)
+
+    val_loader = torch.utils.data.DataLoader(dataset=dataset,
+                                             batch_sampler=validate_sampler, collate_fn=fsd50k_collate_fn,
+                                             num_workers=num_workers, pin_memory=True)
+    return train_loader, val_loader
+
+
+def set_audio_loader(opt):
+    # construct data loader
+    if 'esc50' in opt.dataset:
+        return get_esc50_data_loader(opt)
+    elif opt.dataset == 'fsd50k':
+        return get_fsd50k_data_loader(opt)
+    else:
+        raise ValueError('dataset not supported: {}'.format(opt.dataset))
+
+
+
 def set_model(opt):
-    model = SupCEResNet(name=opt.model, num_classes=opt.n_cls)
+
+    model = SupCENet(sample_rate=opt.sample_rate,
+                     window_size=opt.window_size,
+                     hop_size=opt.hop_size,
+                     mel_bins=opt.mel_bins,
+                     fmin=opt.fmin,
+                     fmax=opt.fmax,
+                     name=opt.model, num_classes=opt.n_cls)
     criterion = torch.nn.CrossEntropyLoss()
 
     # enable synchronized Batch Normalization
@@ -189,24 +254,36 @@ def train(train_loader, model, criterion, optimizer, epoch, opt):
     """one epoch training"""
     model.train()
 
+    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
+    augmentation = opt.augmentation
+
+    batch_num = len(train_loader)
+    idx = 0
+
 
     end = time.time()
-    for idx, (images, labels) in enumerate(train_loader):
+    for batch_data_dict in train_loader:
+        idx += 1
         data_time.update(time.time() - end)
 
-        images = images.cuda(non_blocking=True)
-        labels = labels.cuda(non_blocking=True)
+        # Move data to device
+        for key in batch_data_dict.keys():
+            batch_data_dict[key] = move_data_to_device(batch_data_dict[key], device)
+
+        audio_waveforms = batch_data_dict['waveform']
+        labels = batch_data_dict['target']
         bsz = labels.shape[0]
 
         # warm-up learning rate
         warmup_learning_rate(opt, epoch, idx, len(train_loader), optimizer)
 
         # compute loss
-        output = model(images)
+        output = model(audio_waveforms)
         loss = criterion(output, labels)
 
         # update metric
@@ -233,7 +310,8 @@ def train(train_loader, model, criterion, optimizer, epoch, opt):
                    epoch, idx + 1, len(train_loader), batch_time=batch_time,
                    data_time=data_time, loss=losses, top1=top1))
             sys.stdout.flush()
-
+        if idx > batch_num:
+            break
     return losses.avg, top1.avg
 
 
@@ -241,19 +319,26 @@ def validate(val_loader, model, criterion, opt):
     """validation"""
     model.eval()
 
+    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+
     batch_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
 
     with torch.no_grad():
         end = time.time()
-        for idx, (images, labels) in enumerate(val_loader):
-            images = images.float().cuda()
-            labels = labels.cuda()
+        for idx, batch_data_dict in enumerate(val_loader):
+
+            # Move data to device
+            for key in batch_data_dict.keys():
+                batch_data_dict[key] = move_data_to_device(batch_data_dict[key], device)
+
+            audio_waveforms = batch_data_dict['waveform']
+            labels = batch_data_dict['target']
             bsz = labels.shape[0]
 
             # forward
-            output = model(images)
+            output = model(audio_waveforms)
             loss = criterion(output, labels)
 
             # update metric
@@ -282,7 +367,7 @@ def main():
     opt = parse_option()
 
     # build data loader
-    train_loader, val_loader = set_loader(opt)
+    train_loader, val_loader = set_audio_loader(opt)
 
     # build model and criterion
     model, criterion = set_model(opt)
